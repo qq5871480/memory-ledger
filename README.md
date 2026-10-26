@@ -19,6 +19,7 @@
 - **本地嵌入模型**：`BAAI/bge-small-zh-v1.5`（92MB，torch 本地推理）。不调 embedding API、永久成本为零、数据不出本机；7293 条检索 2ms，不需要向量数据库
 - **记忆分层**：fact / preference / state / procedure / noise，半衰期按类型独立（状态7天、偏好90天、流程10年）
 - **会话档案层**：每天一篇 Markdown 归档，可直接翻阅；原文永远在库里，档案只是浓缩视图
+- **摘要层 L0**：LLM 生成 30-50 字浓缩摘要（必须含实体：日期/单号/服务名/数字），查询时优先展示摘要而非全文 → 输出量降一个数量级
 - **价值排序**：半衰期衰减（事实90天/状态7天）× 可信度加权（agent 1.0 / user 0.7 / 外部转发 0.4），旧事实仍能浮上来，过期状态自动沉底
 - **同会话限流**：单个 session 最多返回2条，防止单日刷屏
 - **敏感双轨**：高敏（密钥/密码模式）直接拒收；低敏（手机号/身份证/银行卡）自动脱敏
@@ -64,7 +65,15 @@ python3 classify_backfill.py
 
 # 生成某天的会话档案
 python3 make_archive.py 2026-10-26
+
+# 生成摘要（L0层）
+python3 make_summary.py          # 全量回填
+python3 summary_inc.py 50        # 增量补前50条
 ```
+
+**摘要生成的两个坑**（都会让摘要变成废话）：
+1. **必须先剥 `[IMPORTANT: ...]` 系统注入前缀**，否则 LLM 看到的是"作为计划任务运行"而不是真内容
+2. **用 `glm-4-flash` 不要用 `glm-4.6`**：4.6 是推理模型，1194 个 reasoning_tokens 会把正文挤掉，`finish_reason=length` 导致解析率归零
 
 **为什么本地嵌入而不是调 API**：
 - API 版（如 MiniMax embo-01）也可用，但**永久成本** + 依赖网络/密钥 + 数据要出境
@@ -132,6 +141,8 @@ python3 embed_backfill.py            # 回填历史向量
 | `embed_backfill.py` | 向量回填（剥系统注入前缀→去重→本地编码→float16存储，断点续传） |
 | `classify_backfill.py` | 记忆分层打标（轻量正则，不用LLM，零成本） |
 | `make_archive.py` | 会话档案生成（每日 Markdown，可翻阅） |
+| `make_summary.py` | 摘要层回填（剥系统前缀→LLM提炼30-50字含实体摘要） |
+| `summary_inc.py` | 摘要增量补（collector 调用，也可独立跑） |
 | `snapshot.sh` | 6小时一致性快照+SHA256+NAS同步（可选）+滚动清理 |
 | `selfcheck.sh` | 每小时自检：断流告警（40min/24h 两级，每小时限1条） |
 | `push_alert.py` | 告警推送（默认打日志，配 `ALERT_WEBHOOK_URL` 走 webhook） |

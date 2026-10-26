@@ -10,9 +10,8 @@ import sqlite3
 import sys
 import time
 
-LEDGER_DIR = os.environ.get('LEDGER_DIR', '/opt/memory-ledger')
-LEDGER = LEDGER_DIR + '/ledger.db'
-ARCHIVE_DIR = LEDGER_DIR + '/archives'
+LEDGER = '/opt/memory-ledger/ledger.db'
+ARCHIVE_DIR = '/opt/memory-ledger/archives'
 NOISE = re.compile(
     r'(用sheet-mcp读取在线进度表|scheduled cron job|ASYNC DELEGATION|'
     r'OUT-OF-BAND USER MESSAGE|Background process|'
