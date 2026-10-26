@@ -168,3 +168,25 @@ python3 embed_backfill.py            # 回填历史向量
 ## License
 
 MIT
+## 性能：常驻向量服务（v2.2）
+
+每次查询重新加载嵌入模型（92MB）会让冷启动耗时 **8.4 秒**。本项目提供常驻服务解决：
+
+```bash
+# 启动（模型预加载约7秒）
+python3 vector_server.py          # 监听 127.0.0.1:9137
+
+# systemd 托管（推荐）
+cp vector_server.py /opt/memory-ledger/
+# 参考 README 的 systemd 段落配置 memory-ledger-vector.service
+```
+
+接口：
+```bash
+curl http://127.0.0.1:9137/health
+curl -X POST http://127.0.0.1:9137/encode -d '{"texts":["测试"],"prefix":"..."}'
+curl -X POST http://127.0.0.1:9137/search -d '{"query":"模糊问法","top":20}'
+```
+
+`query.py` 会优先走服务，**服务不可用时自动降级为本地加载**（功能不受影响，只是慢）。
+实测：查询耗时 **8.6 秒 → 0.93 秒**，常驻内存约 332MB。
