@@ -1,6 +1,8 @@
 # memory-ledger 「小账本」
 
-给 AI Agent 加一个**外挂记忆账本**：把历史会话全文索引进 SQLite（FTS5，jieba+trigram 双索引），Agent 忘了什么随查随得——上下文压缩不再是"失忆"，而是"延迟检索"。
+给 AI Agent 加一个**外挂记忆账本**：把历史会话全文索引进 SQLite，**关键词 + 本地向量双路召回**，Agent 忘了什么随查随得——上下文压缩不再是"失忆"，而是"延迟检索"。
+
+**零 API 依赖**：嵌入模型跑在本地，不花钱、不联网、不上传数据。
 
 ## 为什么需要它
 
@@ -13,7 +15,10 @@
 
 ## 特性
 
-- **三链检索**：jieba 分词 FTS → trigram FTS → LIKE 兜底，从准到宽逐级降级，几乎不空手
+- **双路召回**：① 关键词路（jieba FTS → trigram FTS → LIKE 三链，从准到宽逐级降级）② 语义路（本地 bge-small-zh-v1.5，512维向量，numpy 暴力检索）——**只记得大概的问法也能查**
+- **本地嵌入模型**：`BAAI/bge-small-zh-v1.5`（92MB，torch 本地推理）。不调 embedding API、永久成本为零、数据不出本机；7293 条检索 2ms，不需要向量数据库
+- **记忆分层**：fact / preference / state / procedure / noise，半衰期按类型独立（状态7天、偏好90天、流程10年）
+- **会话档案层**：每天一篇 Markdown 归档，可直接翻阅；原文永远在库里，档案只是浓缩视图
 - **价值排序**：半衰期衰减（事实90天/状态7天）× 可信度加权（agent 1.0 / user 0.7 / 外部转发 0.4），旧事实仍能浮上来，过期状态自动沉底
 - **同会话限流**：单个 session 最多返回2条，防止单日刷屏
 - **敏感双轨**：高敏（密钥/密码模式）直接拒收；低敏（手机号/身份证/银行卡）自动脱敏
@@ -31,10 +36,42 @@ $ query.py '水位'
    （半衰期排序后，结论浮在最上，工具回包沉底）
 
 $ query.py '水位' --role assistant   # 只要人话
-$ query.py '9048' --days 7           # 只看近7天
+$ query.py '项目A' --days 7           # 只看近7天
+$ query.py '项目A' --no-semantic      # 只走关键词（快，省模型加载）
 ```
 
-6087 条 / 46MB 库：FTS 链 0.7ms，LIKE 兜底 15ms，词典加载 0.6s 为固定开销——**撑到十万条级无感知**。
+**双路召回实测**（7 道真实模糊问法，关键词路 vs 双路）：
+
+| 问法 | 关键词路 | 双路 |
+|---|---|---|
+| 「摄像头画面全白是咋回事」 | ❌ 0条 | ✅ 命中 |
+| 「你怎么处理同事改的垃圾数量的」 | ❌ 0条 | ✅ 命中 |
+| 「那个CAD导出坐标的插件怎么用」 | ✅ 1条 | ✅ 5条 |
+
+6087 条 / 46MB 库：FTS 链 0.7ms，LIKE 兜底 15ms，向量检索 2ms，词典加载 0.6s 为固定开销——**撑到十万条级无感知**。
+
+## 语义层怎么用
+
+首次查询会加载模型（约 2-3 秒），之后进程内缓存。模型自动从 HuggingFace 缓存读取（国内走 `HF_ENDPOINT=https://hf-mirror.com`）。
+
+```bash
+# 全量回填向量（已有编码的跳过，断点续传）
+python3 embed_backfill.py
+python3 embed_backfill.py --all      # 强制重编全部
+
+# 重新打记忆分层标签
+python3 classify_backfill.py
+
+# 生成某天的会话档案
+python3 make_archive.py 2026-10-26
+```
+
+**为什么本地嵌入而不是调 API**：
+- API 版（如 MiniMax embo-01）也可用，但**永久成本** + 依赖网络/密钥 + 数据要出境
+- 实测中文历史场景 bge 更准：「那个CAD导出坐标的插件怎么用」bge 0.701 vs embo-01 0.440
+- 本地 20 条/秒（4核CPU），7293 条全量编码 6 分钟
+
+**哪些记录做向量化**：只做 `user`/`assistant` 角色。`tool` 记录占 81% 且是执行噪音，跳过（省80%成本且不损失检索能力）。
 
 ## 快速部署
 
@@ -52,6 +89,7 @@ cp *.py *.sh user_dict.txt /opt/memory-ledger/
 export HERMES_DB=~/.hermes/state.db
 
 # 3) 装三条 cron（注意用装了 jieba 的 python！系统 python 缺包会静默空转）
+#    要语义层还需 torch + transformers（见下）
 crontab -e
 */5 * * * * cd /opt/memory-ledger && python3 collector.py >> collector.log 2>&1
 0 */6 * * * /opt/memory-ledger/snapshot.sh
@@ -61,6 +99,16 @@ crontab -e
 python3 /opt/memory-ledger/query.py '测试'
 tail /opt/memory-ledger/collector.log   # 看到 inserted=N 即通
 ```
+
+### 启用语义层（可选，但推荐）
+
+```bash
+pip install torch transformers        # CPU 版即可
+export HF_ENDPOINT=https://hf-mirror.com   # 国内加速
+python3 embed_backfill.py            # 回填历史向量
+```
+
+不用语义层的话，keyword 路依然完全可用（`--no-semantic` 或不装 torch 都能跑）。
 
 ### 适配其他 Agent 框架
 
@@ -80,7 +128,10 @@ tail /opt/memory-ledger/collector.log   # 看到 inserted=N 即通
 | 文件 | 干什么 |
 |---|---|
 | `collector.py` | 增量采集：读会话库→脱敏→分词→入账（幂等，src_msg_id 防重） |
-| `query.py` | 三链检索+打分排序+角色过滤+量化注入（≤2000字符预算） |
+| `query.py` | **双路召回**（关键词三链+本地向量）+打分排序+角色过滤+量化注入（≤2000字符预算） |
+| `embed_backfill.py` | 向量回填（剥系统注入前缀→去重→本地编码→float16存储，断点续传） |
+| `classify_backfill.py` | 记忆分层打标（轻量正则，不用LLM，零成本） |
+| `make_archive.py` | 会话档案生成（每日 Markdown，可翻阅） |
 | `snapshot.sh` | 6小时一致性快照+SHA256+NAS同步（可选）+滚动清理 |
 | `selfcheck.sh` | 每小时自检：断流告警（40min/24h 两级，每小时限1条） |
 | `push_alert.py` | 告警推送（默认打日志，配 `ALERT_WEBHOOK_URL` 走 webhook） |
@@ -98,7 +149,9 @@ tail /opt/memory-ledger/collector.log   # 看到 inserted=N 即通
 ## 已知边界
 
 - "压缩先于采集"窗口期内容会丢（采集间隔内的最后一次压缩）
-- 纯关键词无语义泛化：查"钢筋报审"召不回"材料复试"——向量检索评估过，暂不上（利弊分析见 discussion）
+- 向量路只覆盖 `user`/`assistant` 记录（`tool` 记录是噪音，不向量化）
+- 首次查询加载模型约 2-3 秒；无网络且模型未缓存时向量路失败，会自动降级为纯关键词
+- 回声降权：assistant 消息里逐字复述了整条查询会被降权 0.35 倍（防自己刚写的复述稿霸榜）
 - 告警防轰炸：每小时最多一条
 
 ## License
