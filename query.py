@@ -12,12 +12,12 @@ import time
 import argparse
 import re
 import os
+import json
 
 import jieba
 
-LEDGER_DIR = os.environ.get('LEDGER_DIR', '/opt/memory-ledger')
-LEDGER = LEDGER_DIR + '/ledger.db'
-JIEBA_DICT = LEDGER_DIR + '/user_dict.txt'
+LEDGER = '/opt/memory-ledger/ledger.db'
+JIEBA_DICT = '/opt/memory-ledger/user_dict.txt'
 TOP_K = 5
 BUDGET = 2000
 HALF_LIFE = {'fact': 90 * 86400, 'preference': 90 * 86400, 'state': 7 * 86400,
@@ -51,17 +51,44 @@ def get_model():
         return None, None
 
 
+VEC_URL = os.environ.get('VEC_SERVER_URL', 'http://127.0.0.1:9137')
+VEC_TIMEOUT = float(os.environ.get('VEC_TIMEOUT', '20'))
+
+
+def _vec_call(path, body):
+    """调用常驻向量服务(模型已加载, 约5ms)。失败返回 None。"""
+    try:
+        import urllib.request
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            VEC_URL + path, data=data,
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=VEC_TIMEOUT) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
 def encode_query(text):
-    """把查询编码成向量"""
+    """把查询编码成向量。优先走常驻服务, 失败则本地加载模型。"""
+    r = _vec_call('/encode', {'texts': [text], 'prefix': PREFIX})
+    if r and r.get('vectors'):
+        v = r['vectors'][0]
+        import numpy as np
+        v = np.array(v, dtype='float32')
+        n = np.linalg.norm(v)
+        if n > 0:
+            return v / n
+    # 降级: 本地加载模型
     tok, mdl = get_model()
     if tok is None:
         return None
+    import numpy as np
     import torch
     b = tok([PREFIX + text], padding=True, truncation=True, max_length=512, return_tensors='pt')
     with torch.no_grad():
         o = mdl(**b).last_hidden_state[:, 0]
     v = o.numpy().astype('float32')[0]
-    import numpy as np
     n = np.linalg.norm(v)
     if n == 0:
         return None
@@ -105,11 +132,30 @@ def tokenize(text):
     return ' '.join(w for w in jieba.cut_for_search(text) if w.strip())
 
 
+# LIKE 查询的长度上限: 超长输入会让 SQLite 抛
+# "OperationalError: LIKE or GLOB pattern too complex" (1028压测发现, 10万字输入直接崩查询)
+MAX_LIKE_LEN = 200
+# LIKE 通配符转义: 用户的 % 和 _ 必须转义, 否则会被当通配符匹配到无关内容
+_LIKE_ESC = '\\'
+
+
+def like_pattern(text):
+    """构造安全的 LIKE pattern。超长则截断并加分隔符。"""
+    t = text.replace(_LIKE_ESC, _LIKE_ESC * 2)
+    t = t.replace('%', _LIKE_ESC + '%').replace('_', _LIKE_ESC + '_')
+    if len(t) > MAX_LIKE_LEN:
+        t = t[:MAX_LIKE_LEN]
+    return '%' + t + '%'
+
+
 def search(keyword, top_k=TOP_K, days=None, session=None, role=None, semantic=True,
            exclude_session=None):
     c = connect()
     now = time.time()
     results = []
+    # 超长输入先截断(避免 FTS MATCH 与 LIKE 都被撑爆)
+    if len(keyword) > 1000:
+        keyword = keyword[:1000]
     toks = tokenize(keyword)
     try:
         rows = c.execute("SELECT rowid FROM fts_jieba WHERE fts_jieba MATCH ? LIMIT ?",
@@ -125,9 +171,13 @@ def search(keyword, top_k=TOP_K, days=None, session=None, role=None, semantic=Tr
         except Exception:
             pass
     if len(keyword) <= 2 or not results:
-        rows = c.execute("SELECT id FROM ledger WHERE content LIKE ? AND status='active' LIMIT ?",
-                         ('%' + keyword + '%', top_k * 4)).fetchall()
-        results += [r[0] for r in rows if r[0] not in results]
+        try:
+            rows = c.execute(
+                "SELECT id FROM ledger WHERE content LIKE ? ESCAPE '\\' AND status='active' LIMIT ?",
+                (like_pattern(keyword), top_k * 4)).fetchall()
+            results += [r[0] for r in rows if r[0] not in results]
+        except Exception:
+            pass
 
     # 向量路: 模糊提问召回
     vec_scores = {}
@@ -147,11 +197,11 @@ def search(keyword, top_k=TOP_K, days=None, session=None, role=None, semantic=Tr
     vec_candidates = [rid for rid in vec_scores if rid not in kw_candidates]
     candidates = kw_candidates[: top_k * 4] + vec_candidates
     for rid in candidates:
-        r = c.execute('SELECT ts,session_id,role,content,type,status,source_type,trust_level,origin '
+        r = c.execute('SELECT ts,session_id,role,content,type,status,source_type,trust_level,origin,summary '
                       'FROM ledger WHERE id=?', (rid,)).fetchone()
         if not r:
             continue
-        ts, sess, row_role, content, typ, status, stype, tl, origin = r
+        ts, sess, row_role, content, typ, status, stype, tl, origin, summ = r
         if status != 'active':
             continue
         if days and now - ts > days * 86400:
@@ -187,7 +237,7 @@ def search(keyword, top_k=TOP_K, days=None, session=None, role=None, semantic=Tr
         else:
             snip = content[:400]
         out.append((score, rid, ts, sess, row_role, snip, stype, tl, origin, kw_hit,
-                    vec_scores.get(rid, 0.0)))
+                    vec_scores.get(rid, 0.0), summ))
     out.sort(key=lambda x: -x[0])
     sess_count = {}
     final = []
@@ -202,17 +252,22 @@ def search(keyword, top_k=TOP_K, days=None, session=None, role=None, semantic=Tr
     return final
 
 
-def format_out(final, keyword):
+def format_out(final, keyword, summary_only=False):
     total = 0
     body = []
-    for score, rid, ts, sess, row_role, snip, stype, tl, origin, kw_hit, sim in final:
+    for score, rid, ts, sess, row_role, snip, stype, tl, origin, kw_hit, sim, summ in final:
         tstr = time.strftime('%m-%d %H:%M', time.localtime(ts))
         tags = []
         tags.append('词' if kw_hit else '义')
         if sim:
             tags.append('sim%.2f' % sim)
-        block = '[%s|%s|%s/%s|%s] ...%s... (id:%s src:%s)' % (
-            tstr, row_role, stype, tl, '/'.join(tags), snip, rid, origin)
+        # 摘要层: 有摘要就优先展示摘要(省token), 没有才退回全文片段
+        if summ:
+            content = '摘要: ' + summ
+        else:
+            content = '...' + snip + '...'
+        block = '[%s|%s|%s/%s|%s] %s (id:%s src:%s)' % (
+            tstr, row_role, stype, tl, '/'.join(tags), content, rid, origin)
         if total + len(block) > BUDGET:
             break
         total += len(block)
