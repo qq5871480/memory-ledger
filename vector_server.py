@@ -82,10 +82,20 @@ def load_matrix():
 
 _matrix = {'M': None, 'ids': [], 'ts': 0.0}
 _cache_ttl = 30.0  # 秒
+_matrix_lock = threading.Lock()   # 只保护矩阵重载, 不阻塞推理
 
 
 def get_matrix():
-    with _lock:
+    """取向量矩阵。命中缓存直接返回; 过期则重载。
+
+    1028压力测试发现: 高并发下 ConnectionResetError。
+    两个根因:
+      1) ThreadingHTTPServer 默认 listen backlog = 5, 30+并发时accept队列溢出
+      2) BaseHTTPRequestHandler 默认 HTTP/1.0, 每请求新建TCP连接, 高并发时端口耗尽
+    修法: request_queue_size=128 + protocol_version='HTTP/1.1' keep-alive。
+    另外矩阵重载(读1500+行sqlite)会阻塞所有请求, 改为后台线程预热。
+    """
+    with _matrix_lock:
         if _matrix['M'] is None or (time.time() - _matrix['ts']) > _cache_ttl:
             M, ids = load_matrix()
             _matrix['M'] = M
@@ -122,8 +132,14 @@ def handle(path, body):
 
 def main():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import socketserver
 
     class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.1 keep-alive: 高并发下复用TCP连接, 避免端口耗尽(1028压测)
+        protocol_version = 'HTTP/1.1'
+        # 单请求体上限, 防超大payload打爆内存
+        max_body = 8 * 1024 * 1024
+
         def log_message(self, *a):
             pass
 
@@ -139,15 +155,30 @@ def main():
             try:
                 self._send(handle(self.path.split('?')[0], {}))
             except Exception as e:
-                self._send({'error': str(e)}, 500)
+                try:
+                    self._send({'error': str(e)}, 500)
+                except Exception:
+                    pass
 
         def do_POST(self):
             try:
                 n = int(self.headers.get('Content-Length', 0))
+                if n > self.max_body:
+                    self._send({'error': 'payload too large'}, 413)
+                    return
                 body = json.loads(self.rfile.read(n)) if n else {}
                 self._send(handle(self.path.split('?')[0], body))
             except Exception as e:
-                self._send({'error': str(e)}, 500)
+                try:
+                    self._send({'error': str(e)}, 500)
+                except Exception:
+                    pass
+
+    class RobustServer(ThreadingHTTPServer):
+        # listen backlog: 默认5太小, 高并发时accept队列溢出 → ConnectionReset
+        request_queue_size = 128
+        daemon_threads = True
+        allow_reuse_address = True
 
     # 预热模型(避免第一个请求等8秒)
     print('preloading model...', flush=True)
@@ -157,8 +188,19 @@ def main():
     M, ids = get_matrix()
     print('matrix: %d x %d' % (M.shape if len(M.shape) == 2 else (0, 0)), flush=True)
 
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    print('serving on %s:%d' % (HOST, PORT), flush=True)
+    # 后台线程定期预热矩阵(不阻塞请求处理)
+    def _refresher():
+        while True:
+            time.sleep(20)
+            try:
+                get_matrix()
+            except Exception:
+                pass
+
+    threading.Thread(target=_refresher, daemon=True).start()
+
+    srv = RobustServer((HOST, PORT), Handler)
+    print('serving on %s:%d (backlog=%d)' % (HOST, PORT, RobustServer.request_queue_size), flush=True)
     srv.serve_forever()
 
 
